@@ -99,7 +99,7 @@ let matches = [
   {id:'53452561', date:'2026-06-30T10:00:00-07:00', round:'Round Of 32', home:'Ivory Coast', homeZh:'科特迪瓦', away:'Norway', awayZh:'挪威', status:'Complete', homeScore:'1', awayScore:'2', advance:'Norway advanced to 53452517'},
   {id:'53452543', date:'2026-06-30T14:00:00-07:00', round:'Round Of 32', home:'France', homeZh:'法国', away:'Sweden', awayZh:'瑞典', status:'Complete', homeScore:'3', awayScore:'0', advance:'France advanced to 53452509'},
   {id:'53452563', date:'2026-06-30T19:00:00-07:00', round:'Round Of 32', home:'Mexico', homeZh:'墨西哥', away:'Ecuador', awayZh:'厄瓜多尔', status:'Complete', homeScore:'2', awayScore:'0', advance:'Mexico advanced to 53452519'},
-  {id:'53452565', date:'2026-07-01T09:00:00-07:00', round:'Round Of 32', home:'England', homeZh:'英格兰', away:'DR Congo', awayZh:'刚果民主共和国', status:'Scheduled', advance:'Winner advances to 53452519'},
+  {id:'53452565', date:'2026-07-01T09:00:00-07:00', round:'Round Of 32', home:'England', homeZh:'英格兰', away:'DR Congo', awayZh:'刚果民主共和国', status:'In Progress', homeScore:'0', awayScore:'1', advance:'Winner advances to 53452519'},
   {id:'53452555', date:'2026-07-01T13:00:00-07:00', round:'Round Of 32', home:'Belgium', homeZh:'比利时', away:'Senegal', awayZh:'塞内加尔', status:'Scheduled', advance:'Winner advances to 53452515'},
   {id:'53452553', date:'2026-07-01T17:00:00-07:00', round:'Round Of 32', home:'United States', homeZh:'美国', away:'Bosnia and Herzegovina', awayZh:'波黑', status:'Scheduled', advance:'Winner advances to 53452515'},
   {id:'53452551', date:'2026-07-02T12:00:00-07:00', round:'Round Of 32', home:'Spain', homeZh:'西班牙', away:'Austria', awayZh:'奥地利', status:'Scheduled', advance:'Winner advances to 53452513'},
@@ -149,21 +149,44 @@ function card(m){
   const scoreHome = m.homeScore ?? '—', scoreAway = m.awayScore ?? '—';
   return `<article class="card"><div class="cardTop"><div><div class="round">${round}</div><div class="meta">${localTime(m.date)}</div></div><span class="badge ${badgeClass}">${status}</span></div><div class="teams"><div class="team"><span>${home}</span><span class="score">${scoreHome}</span></div><div class="team"><span>${away}</span><span class="score">${scoreAway}</span></div></div><div class="meta">ID: ${m.id}</div>${m.advance ? `<div class="advance">${language==='zh' ? m.advance.replace('Winner advances to','胜者晋级至').replace('advanced to','晋级至').replace('Canada','加拿大').replace('Brazil','巴西').replace('Paraguay','巴拉圭').replace('Morocco','摩洛哥').replace('Norway','挪威').replace('France','法国').replace('Mexico','墨西哥').replace('loser to third-place match','负者进入三四名决赛').replace('Winner advances to final;','胜者进入决赛；') : m.advance}</div>` : ''}</article>`;
 }
+function yyyymmdd(d){
+  const x = new Date(d);
+  return `${x.getUTCFullYear()}${String(x.getUTCMonth()+1).padStart(2,'0')}${String(x.getUTCDate()).padStart(2,'0')}`;
+}
+function normalizeStatus(e){
+  const type = e?.status?.type || {};
+  const state = String(type.state || '').toLowerCase();
+  const name = String(type.name || type.description || '').toLowerCase();
+  if (type.completed || state === 'post' || name.includes('final')) return 'Complete';
+  if (state === 'in' || name.includes('progress') || name.includes('halftime') || name.includes('live')) return 'In Progress';
+  return 'Scheduled';
+}
+async function fetchScoreboardFor(dateStr){
+  const url = `${ESPN_SCOREBOARD}?dates=${dateStr}&limit=100&_=${Date.now()}`;
+  const res = await fetch(url, {cache:'no-store'});
+  if(!res.ok) throw new Error('Scoreboard unavailable');
+  return res.json();
+}
 async function updateFromESPN(){
+  let updated = false;
   try {
-    const res = await fetch(ESPN_SCOREBOARD, {cache:'no-store'});
-    if(!res.ok) throw new Error('Scoreboard unavailable');
-    const data = await res.json();
-    const events = data.events || [];
+    // ESPN's default scoreboard can omit in-progress games on some browsers, so fetch date-specific boards too.
+    const dateKeys = [...new Set(matches.map(m => yyyymmdd(m.date)))];
+    const todayKey = yyyymmdd(new Date());
+    const priorityKeys = [...new Set([todayKey, ...dateKeys])];
+    const settled = await Promise.allSettled(priorityKeys.map(fetchScoreboardFor));
+    const events = settled.flatMap(r => r.status === 'fulfilled' ? (r.value.events || []) : []);
     const byId = new Map(events.map(e => [String(e.id), e]));
     matches = matches.map(m => {
-      const e = byId.get(m.id); if(!e) return m;
+      const e = byId.get(String(m.id));
+      if(!e) return m;
       const comp = e.competitions?.[0]; const competitors = comp?.competitors || [];
       const home = competitors.find(c=>c.homeAway==='home') || competitors[0];
       const away = competitors.find(c=>c.homeAway==='away') || competitors[1];
-      return {...m, date:e.date || m.date, status: e.status?.type?.completed ? 'Complete' : (e.status?.type?.state === 'in' ? 'In Progress' : 'Scheduled'), home: home?.team?.displayName || m.home, away: away?.team?.displayName || m.away, homeScore: home?.score ?? m.homeScore, awayScore: away?.score ?? m.awayScore};
+      updated = true;
+      return {...m, date:e.date || m.date, status: normalizeStatus(e), home: home?.team?.displayName || m.home, away: away?.team?.displayName || m.away, homeScore: home?.score ?? m.homeScore, awayScore: away?.score ?? m.awayScore};
     });
-    document.getElementById('sourceText').textContent = 'ESPN live scoreboard + fallback schedule';
+    document.getElementById('sourceText').textContent = updated ? 'Live scoreboard + fallback schedule' : 'Fallback schedule (no live event match found)';
   } catch(err) {
     document.getElementById('sourceText').textContent = 'Fallback schedule (live API not reachable)';
   }
