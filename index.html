@@ -85,11 +85,11 @@ footer { color:var(--muted); text-align:center; padding:24px; border-top:1px sol
   </main>
 
   <footer>
-    <span data-en="Tip: deploy this folder to Netlify, Vercel, GitHub Pages, or any static web host. The page will keep trying to refresh live match data." data-zh="提示：可将此文件夹部署到 Netlify、Vercel、GitHub Pages 或任何静态网站托管服务。页面会持续尝试刷新实时比赛数据。">Tip: deploy this folder to Netlify, Vercel, GitHub Pages, or any static web host. The page will keep trying to refresh live match data.</span>
+    <span data-en="Live scores refresh every 15 seconds while the page is open. Data depends on the public scoreboard feed, which may still lag during live games." data-zh="页面打开时每 15 秒刷新一次实时比分。数据取决于公开比分源，直播期间仍可能有延迟。">Live scores refresh every 15 seconds while the page is open. Data depends on the public scoreboard feed, which may still lag during live games.</span>
   </footer>
   <script>
 const ESPN_SCOREBOARD = 'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard';
-const REFRESH_MS = 60000;
+const REFRESH_MS = 15000;
 let language = 'en';
 let matches = [
   {id:'53452545', date:'2026-06-28T12:00:00-07:00', round:'Round Of 32', home:'South Africa', homeZh:'南非', away:'Canada', awayZh:'加拿大', status:'Complete', homeScore:'0', awayScore:'1', advance:'Canada advanced to 53452511'},
@@ -161,38 +161,56 @@ function normalizeStatus(e){
   if (state === 'in' || name.includes('progress') || name.includes('halftime') || name.includes('live')) return 'In Progress';
   return 'Scheduled';
 }
-async function fetchScoreboardFor(dateStr){
-  const url = `${ESPN_SCOREBOARD}?dates=${dateStr}&limit=100&_=${Date.now()}`;
-  const res = await fetch(url, {cache:'no-store'});
-  if(!res.ok) throw new Error('Scoreboard unavailable');
+async function fetchJson(url){
+  const res = await fetch(url + (url.includes('?') ? '&' : '?') + '_=' + Date.now(), {cache:'no-store', headers:{'Cache-Control':'no-cache'}});
+  if(!res.ok) throw new Error('Feed unavailable');
   return res.json();
+}
+async function fetchScoreboardFor(dateStr){
+  return fetchJson(`${ESPN_SCOREBOARD}?dates=${dateStr}&limit=100`);
+}
+async function fetchEventSummary(eventId){
+  return fetchJson(`https://site.web.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${eventId}`);
+}
+function eventFromSummary(summary){
+  if(!summary) return null;
+  if(summary.header?.competitions?.[0]) return {id: summary.header.id || summary.header.competitions[0].id, date: summary.header.competitions[0].date, competitions: summary.header.competitions, status: summary.header.competitions[0].status};
+  return null;
+}
+function applyEventToMatch(m, e){
+  const comp = e.competitions?.[0]; const competitors = comp?.competitors || [];
+  const home = competitors.find(c=>c.homeAway==='home') || competitors[0];
+  const away = competitors.find(c=>c.homeAway==='away') || competitors[1];
+  return {...m, date:e.date || comp?.date || m.date, status: normalizeStatus(e), home: home?.team?.displayName || m.home, away: away?.team?.displayName || m.away, homeScore: home?.score ?? m.homeScore, awayScore: away?.score ?? m.awayScore};
 }
 async function updateFromESPN(){
   let updated = false;
   try {
-    // ESPN's default scoreboard can omit in-progress games on some browsers, so fetch date-specific boards too.
+    // Use both scoreboard feeds and per-game summary feeds. The summary endpoint is often fresher during live matches.
     const dateKeys = [...new Set(matches.map(m => yyyymmdd(m.date)))];
     const todayKey = yyyymmdd(new Date());
     const priorityKeys = [...new Set([todayKey, ...dateKeys])];
-    const settled = await Promise.allSettled(priorityKeys.map(fetchScoreboardFor));
-    const events = settled.flatMap(r => r.status === 'fulfilled' ? (r.value.events || []) : []);
-    const byId = new Map(events.map(e => [String(e.id), e]));
+    const activeIds = matches.filter(m => m.status === 'In Progress' || Math.abs(new Date(m.date) - new Date()) < 4*60*60*1000).map(m => m.id);
+    const settledBoards = await Promise.allSettled(priorityKeys.map(fetchScoreboardFor));
+    const boardEvents = settledBoards.flatMap(r => r.status === 'fulfilled' ? (r.value.events || []) : []);
+    const settledSummaries = await Promise.allSettled(activeIds.map(fetchEventSummary));
+    const summaryEvents = settledSummaries.flatMap(r => r.status === 'fulfilled' ? [eventFromSummary(r.value)].filter(Boolean) : []);
+    const byId = new Map([...boardEvents, ...summaryEvents].map(e => [String(e.id), e]));
     matches = matches.map(m => {
       const e = byId.get(String(m.id));
       if(!e) return m;
-      const comp = e.competitions?.[0]; const competitors = comp?.competitors || [];
-      const home = competitors.find(c=>c.homeAway==='home') || competitors[0];
-      const away = competitors.find(c=>c.homeAway==='away') || competitors[1];
       updated = true;
-      return {...m, date:e.date || m.date, status: normalizeStatus(e), home: home?.team?.displayName || m.home, away: away?.team?.displayName || m.away, homeScore: home?.score ?? m.homeScore, awayScore: away?.score ?? m.awayScore};
+      return applyEventToMatch(m, e);
     });
-    document.getElementById('sourceText').textContent = updated ? 'Live scoreboard + fallback schedule' : 'Fallback schedule (no live event match found)';
+    document.getElementById('sourceText').textContent = updated ? 'Live scoreboard/summary + fallback schedule' : 'Fallback schedule (no live event match found)';
   } catch(err) {
     document.getElementById('sourceText').textContent = 'Fallback schedule (live API not reachable)';
   }
   document.getElementById('lastUpdated').textContent = new Date().toLocaleString(language==='zh'?'zh-CN':'en-US');
   render();
 }
+window.addEventListener('focus', updateFromESPN);
+document.addEventListener('visibilitychange', () => { if(!document.hidden) updateFromESPN(); });
 document.getElementById('langBtn').addEventListener('click', () => { language = language === 'en' ? 'zh' : 'en'; render(); });
 document.getElementById('refreshBtn').addEventListener('click', updateFromESPN);
 ['searchInput','roundFilter','statusFilter'].forEach(id => document.getElementById(id).addEventListener('input', render));
